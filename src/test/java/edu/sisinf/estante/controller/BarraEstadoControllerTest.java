@@ -3,13 +3,13 @@ package edu.sisinf.chuspadb.controller;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.verify;
 import static org.junit.jupiter.api.Assertions.fail;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import edu.sisinf.chuspadb.core.ErrorConexion;
 import edu.sisinf.chuspadb.core.ErrorQuery;
@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import javafx.scene.control.Label;
 import org.junit.jupiter.api.BeforeEach;
 import java.util.concurrent.CountDownLatch;
+import javafx.application.Application;
 import javafx.application.Platform;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -40,6 +41,11 @@ import org.mockito.junit.jupiter.MockitoExtension;
  * <p>Los {@code Label} se inyectan por reflexión (los campos {@code @FXML} son privados). Se arranca
  * el toolkit de JavaFX una sola vez; como el controlador actualiza la UI con
  * {@code Platform.runLater}, las aserciones esperan a que el hilo de JavaFX procese lo encolado.
+ *
+ * <p>Si no hay entorno gráfico (por ejemplo, Linux sin DISPLAY en integración continua) las
+ * pruebas no se omiten: se ejecutan sin toolkit y el controlador aplica las actualizaciones
+ * directamente en el hilo actual. Ese modo también puede forzarse con
+ * {@code -Dchuspadb.test.sinToolkit=true}.
  */
 @ExtendWith(MockitoExtension.class)
 class BarraEstadoControllerTest {
@@ -57,30 +63,72 @@ class BarraEstadoControllerTest {
     @Mock
     private Runnable operacion;
 
+    /** Indica si hay un toolkit de JavaFX en ejecución (solo cuando existe entorno gráfico). */
+    private static boolean toolkitActivo;
+
     @BeforeAll
     static void iniciarToolkitJavaFX() throws Exception {
-        CountDownLatch listo = new CountDownLatch(1);
-        try {
-            Platform.startup(listo::countDown);
-        } catch (IllegalStateException yaIniciado) {
-            listo.countDown();
-        } catch (RuntimeException sinEntornoGrafico) {
-            assumeTrue(false, "JavaFX no se pudo iniciar: " + sinEntornoGrafico);
+        boolean forzarSinToolkit = Boolean.getBoolean("chuspadb.test.sinToolkit");
+
+        if (!forzarSinToolkit && hayEntornoGrafico()) {
+            CountDownLatch listo = new CountDownLatch(1);
+            try {
+                Platform.startup(listo::countDown);
+            } catch (IllegalStateException yaIniciado) {
+                listo.countDown();
+            }
+            toolkitActivo = listo.await(10, TimeUnit.SECONDS);
+            assertTrue(toolkitActivo, "El toolkit de JavaFX no arrancó a tiempo");
+        } else {
+            permitirControlesSinToolkit();
         }
-        assumeTrue(listo.await(10, TimeUnit.SECONDS), "El toolkit de JavaFX no arrancó a tiempo");
+        System.out.println("[BarraEstadoControllerTest] toolkit de JavaFX activo: " + toolkitActivo);
     }
 
-    /** Espera a que el hilo de JavaFX procese lo encolado con runLater y devuelve el texto. */
-    private static String texto(Label label) {
-        CountDownLatch procesado = new CountDownLatch(1);
-        Platform.runLater(procesado::countDown);
+    /** En Linux solo hay toolkit si existe un servidor gráfico (X11 o Wayland). */
+    private static boolean hayEntornoGrafico() {
+        if (!System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+            return true;
+        }
+        return hayValor(System.getenv("DISPLAY")) || hayValor(System.getenv("WAYLAND_DISPLAY"));
+    }
+
+    private static boolean hayValor(String valor) {
+        return valor != null && !valor.isBlank();
+    }
+
+    /**
+     * Sin toolkit, la clase Control de JavaFX intenta cargar la hoja de estilos por defecto al
+     * inicializarse y falla con "Toolkit not initialized". Registrar antes una hoja de estilos de
+     * usuario evita ese paso, y así se pueden crear los Label sin entorno gráfico.
+     */
+    private static void permitirControlesSinToolkit() {
         try {
-            if (!procesado.await(5, TimeUnit.SECONDS)) {
-                fail("El hilo de JavaFX no procesó las actualizaciones a tiempo.");
+            Application.setUserAgentStylesheet(Application.STYLESHEET_MODENA);
+        } catch (IllegalStateException toolkitNoIniciado) {
+            // Esperado sin toolkit: la hoja de estilos ya quedó registrada antes del aviso al toolkit.
+        }
+        assertNotNull(
+                Application.getUserAgentStylesheet(),
+                "No fue posible preparar JavaFX sin entorno gráfico");
+    }
+
+    /**
+     * Devuelve el texto del label. Con toolkit activo espera a que el hilo de JavaFX procese lo
+     * encolado con runLater; sin toolkit el controlador actualiza directamente en el hilo actual.
+     */
+    private static String texto(Label label) {
+        if (toolkitActivo) {
+            CountDownLatch procesado = new CountDownLatch(1);
+            Platform.runLater(procesado::countDown);
+            try {
+                if (!procesado.await(5, TimeUnit.SECONDS)) {
+                    fail("El hilo de JavaFX no procesó las actualizaciones a tiempo.");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                fail("Interrumpido mientras se esperaba al hilo de JavaFX.");
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            fail("Interrumpido mientras se esperaba al hilo de JavaFX.");
         }
         return label.getText();
     }
